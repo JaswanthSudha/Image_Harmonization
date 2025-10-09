@@ -1,14 +1,13 @@
 import os
 import torch
 import numpy as np
-import time
 from PIL import Image
 import torchvision.transforms.functional as tf
 from options.test_options import TestOptions
 from models import create_model
 import torchvision.transforms as transforms
 from util import util
-
+import time
 
 class PatchBasedInference:
     def __init__(self, opt, patch_size=512, overlap=64):
@@ -32,50 +31,6 @@ class PatchBasedInference:
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
         
-    def load_image_with_exr_support(self, path, mode='RGB'):
-        """
-        Load image with EXR support fallback
-        
-        Args:
-            path: Path to image
-            mode: PIL image mode ('RGB' or 'L')
-            
-        Returns:
-            PIL Image
-        """
-        try:
-            if mode == 'RGB':
-                return Image.open(path).convert('RGB')
-            else:
-                return Image.open(path).convert('L')
-        except Exception as e:
-            print(f"Warning: Could not load image as standard format: {e}")
-            if path.lower().endswith('.exr'):
-                try:
-                    import cv2
-                    print(f"Attempting to load EXR with OpenCV...")
-                    
-                    if mode == 'RGB':
-                        exr_img = cv2.imread(path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
-                        if exr_img is None:
-                            raise Exception("Could not load EXR file with OpenCV")
-                        exr_img = cv2.cvtColor(exr_img, cv2.COLOR_BGR2RGB)
-                        exr_img = np.clip(exr_img * 255, 0, 255).astype(np.uint8)
-                        return Image.fromarray(exr_img)
-                    else:
-                        exr_img = cv2.imread(path, cv2.IMREAD_GRAYSCALE | cv2.IMREAD_ANYDEPTH)
-                        if exr_img is None:
-                            raise Exception("Could not load EXR file with OpenCV")
-                        exr_img = np.clip(exr_img * 255, 0, 255).astype(np.uint8)
-                        return Image.fromarray(exr_img).convert('L')
-                        
-                except ImportError:
-                    raise Exception("OpenCV not available for EXR loading")
-                except Exception as cv_error:
-                    raise Exception(f"Could not load EXR file: {cv_error}")
-            else:
-                raise e
-        
     def process_image(self, comp_path, mask_path):
         """
         Process a high-resolution image using patch-based inference
@@ -87,25 +42,9 @@ class PatchBasedInference:
         Returns:
             harmonized_image: PIL Image of the result
         """
-        # Load images with EXR support
-        comp = self.load_image_with_exr_support(comp_path, 'RGB')
-        mask = self.load_image_with_exr_support(mask_path, 'L').convert('1')
-        
-        # Ensure both images have the same size before processing
-        print(f"Composite size: {comp.size}, Mask size: {mask.size}")
-        if comp.size != mask.size:
-            print(f"Resizing mask from {mask.size} to {comp.size} to match composite")
-            # Use older PIL compatibility for resampling
-            try:
-                # Try newer PIL syntax first
-                mask = mask.resize(comp.size, Image.Resampling.NEAREST)  # preserves binary mask edges
-                print(f"Resized mask using newer PIL syntax")
-            except AttributeError:
-                # Fall back to older PIL syntax
-                mask = mask.resize(comp.size, Image.NEAREST)  # preserves binary mask edges
-                print(f"Resized mask using older PIL syntax")
-        else:
-            print(f"Composite and mask have the same size: {comp.size}")
+        # Load images
+        comp = Image.open(comp_path).convert('RGB')
+        mask = Image.open(mask_path).convert('1')
         
         # Get original size
         orig_w, orig_h = comp.size
@@ -147,24 +86,13 @@ class PatchBasedInference:
                 comp_patch = comp_tensor[:, start_h:start_h+self.patch_size, start_w:start_w+self.patch_size]
                 mask_patch = mask_tensor[:, start_h:start_h+self.patch_size, start_w:start_w+self.patch_size]
                 
-                # Debug: Check initial patch sizes
-                print(f"Patch {i},{j}: comp_patch shape: {comp_patch.shape}, mask_patch shape: {mask_patch.shape}")
-                
                 # Ensure patch is exactly patch_size
                 if comp_patch.shape[1] != self.patch_size or comp_patch.shape[2] != self.patch_size:
                     comp_patch = tf.resize(comp_patch, [self.patch_size, self.patch_size])
                     mask_patch = tf.resize(mask_patch, [self.patch_size, self.patch_size])
-                    print(f"Resized patches to {self.patch_size}x{self.patch_size}")
-                
-                # Debug: Check final patch sizes
-                print(f"Final shapes before cat: comp: {comp_patch.shape}, mask: {mask_patch.shape}")
                 
                 # Normalize patch
                 comp_patch = tf.normalize(comp_patch, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-                
-                # Final safety check before concatenation
-                # assert comp_patch.shape[1] == self.patch_size and comp_patch.shape[2] == self.patch_size, f"comp_patch wrong size: {comp_patch.shape}"
-                # assert mask_patch.shape[1] == self.patch_size and mask_patch.shape[2] == self.patch_size, f"mask_patch wrong size: {mask_patch.shape}"
                 
                 # Prepare input for model
                 inputs = torch.cat([comp_patch, mask_patch], 0).unsqueeze(0)
@@ -219,7 +147,6 @@ class PatchBasedInference:
         
         return output_image
 
-
 def main():
     opt = TestOptions().parse()
     opt.num_threads = 0
@@ -229,40 +156,12 @@ def main():
     opt.display_id = -1
     opt.dataset_mode = 'inference'  # Use our inference dataset
     
-    test_file_path = os.path.join(opt.dataset_root, "IHD_test.txt")
-    if not os.path.exists(test_file_path):
-        raise FileNotFoundError(f"Test file not found: {test_file_path}")
-    
-    with open(test_file_path, 'r') as f:
-        composite_filename = f.read().strip()
-    
-    print(f"Reading from test file: {composite_filename}")
-    
-    base_name = os.path.splitext(composite_filename)[0]
-    if base_name.endswith('_2'):
-        mask_base = base_name[:-2]
-    else:
-        mask_base = base_name
-    
-    comp_path = os.path.join(opt.dataset_root, composite_filename)
-    
-    mask_extensions = ['.png', '.exr']
-    mask_path = None
-    
-    for ext in mask_extensions:
-        potential_mask = os.path.join(opt.dataset_root, "masks", f"{os.path.basename(mask_base)}{ext}")
-        if os.path.exists(potential_mask):
-            mask_path = potential_mask
-            break
-    
-    if mask_path is None:
-        raise FileNotFoundError(f"Mask file not found for base name: {mask_base}")
-    
-    print(f"Using composite: {comp_path}")
-    print(f"Using mask: {mask_path}")
-    
     # Initialize patch-based processor
     processor = PatchBasedInference(opt, patch_size=512, overlap=64)
+    
+    # Process your image
+    comp_path = os.path.join(opt.dataset_root, "composite_images", "sample_1_2.jpg")
+    mask_path = os.path.join(opt.dataset_root, "masks", "sample_1.png")
     
     print(f"Starting patch-based 4K inference...")
     start_time = time.time()
@@ -275,14 +174,11 @@ def main():
     # Save result
     output_dir = os.path.join(opt.results_dir, opt.name, "patch_based_4k")
     os.makedirs(output_dir, exist_ok=True)
-    
-    output_filename = f"{os.path.basename(mask_base)}_4k_harmonized.jpg"
-    output_path = os.path.join(output_dir, output_filename)
+    output_path = os.path.join(output_dir, "sample_1_2_4k_harmonized.jpg")
     result.save(output_path, quality=95)
     
     print(f"4K harmonized image saved to: {output_path}")
     print(f"Output size: {result.size[0]}x{result.size[1]}")
-
 
 if __name__ == '__main__':
     main()
