@@ -92,20 +92,15 @@ class PatchBasedInference:
         mask = self.load_image_with_exr_support(mask_path, 'L').convert('1')
         
         # Ensure both images have the same size before processing
-        print(f"Composite size: {comp.size}, Mask size: {mask.size}")
         if comp.size != mask.size:
             print(f"Resizing mask from {mask.size} to {comp.size} to match composite")
             # Use older PIL compatibility for resampling
             try:
                 # Try newer PIL syntax first
                 mask = mask.resize(comp.size, Image.Resampling.NEAREST)  # preserves binary mask edges
-                print(f"Resized mask using newer PIL syntax")
             except AttributeError:
                 # Fall back to older PIL syntax
                 mask = mask.resize(comp.size, Image.NEAREST)  # preserves binary mask edges
-                print(f"Resized mask using older PIL syntax")
-        else:
-            print(f"Composite and mask have the same size: {comp.size}")
         
         # Get original size
         orig_w, orig_h = comp.size
@@ -147,17 +142,10 @@ class PatchBasedInference:
                 comp_patch = comp_tensor[:, start_h:start_h+self.patch_size, start_w:start_w+self.patch_size]
                 mask_patch = mask_tensor[:, start_h:start_h+self.patch_size, start_w:start_w+self.patch_size]
                 
-                # Debug: Check initial patch sizes
-                print(f"Patch {i},{j}: comp_patch shape: {comp_patch.shape}, mask_patch shape: {mask_patch.shape}")
-                
                 # Ensure patch is exactly patch_size
                 if comp_patch.shape[1] != self.patch_size or comp_patch.shape[2] != self.patch_size:
                     comp_patch = tf.resize(comp_patch, [self.patch_size, self.patch_size])
                     mask_patch = tf.resize(mask_patch, [self.patch_size, self.patch_size])
-                    print(f"Resized patches to {self.patch_size}x{self.patch_size}")
-                
-                # Debug: Check final patch sizes
-                print(f"Final shapes before cat: comp: {comp_patch.shape}, mask: {mask_patch.shape}")
                 
                 # Normalize patch
                 comp_patch = tf.normalize(comp_patch, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
@@ -213,7 +201,7 @@ class PatchBasedInference:
         # Normalize by weights
         output_tensor = output_tensor / torch.clamp(weight_map, min=1e-8)
         
-        # Convert to PIL Image
+        # Convert to PIL Image - use standard 8-bit conversion for all formats
         output_np = (output_tensor.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
         output_image = Image.fromarray(output_np)
         
@@ -276,11 +264,32 @@ def main():
     output_dir = os.path.join(opt.results_dir, opt.name, "patch_based_4k")
     os.makedirs(output_dir, exist_ok=True)
     
-    output_filename = f"{os.path.basename(mask_base)}_4k_harmonized.jpg"
-    output_path = os.path.join(output_dir, output_filename)
-    result.save(output_path, quality=95)
+    # Choose output format based on input
+    if comp_path.lower().endswith('.exr'):
+        output_filename = f"{os.path.basename(mask_base)}_4k_harmonized.exr"
+        output_path = os.path.join(output_dir, output_filename)
+        
+        # Try to save as EXR using OpenCV for better HDR support
+        try:
+            import cv2
+            # Convert PIL image to float range for EXR
+            result_np = np.array(result).astype(np.float32) / 255.0  # Convert uint8 to float range
+            result_bgr = cv2.cvtColor(result_np, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(output_path, result_bgr)
+            print(f"4K harmonized EXR saved using OpenCV: {output_path}")
+        except Exception as e:
+            print(f"OpenCV EXR save failed: {e}, falling back to standard JPG")
+            # Fall back to JPG if EXR saving fails
+            output_filename = f"{os.path.basename(mask_base)}_4k_harmonized.jpg"
+            output_path = os.path.join(output_dir, output_filename)
+            result.save(output_path, quality=95)
+            print(f"4K harmonized image saved as JPG: {output_path}")
+    else:
+        output_filename = f"{os.path.basename(mask_base)}_4k_harmonized.jpg"
+        output_path = os.path.join(output_dir, output_filename)
+        result.save(output_path, quality=95)
+        print(f"4K harmonized image saved to: {output_path}")
     
-    print(f"4K harmonized image saved to: {output_path}")
     print(f"Output size: {result.size[0]}x{result.size[1]}")
 
 
